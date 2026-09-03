@@ -310,9 +310,100 @@ function onOpen() {
   writeBlock(gAbsIncModal.format(90), gFeedModeModal.format(94), gPlaneModal.format(17));
   writeBlock(gUnitModal.format(unit == MM ? 21 : 20));
   validateCommonParameters();
+  reportAAxisIndexingSummary(); // show operation overview + format warnings in Fusion popup
 }
 
 function onParameter(name, value) {
+}
+
+/**
+ * Scans all SETUPS (unique job-description values) and reports the A-axis
+ * indexing plan in two ways:
+ *
+ *   1. NC FILE COMMENTS written into the program header - always visible in
+ *      the Fusion 360 NC preview window and in any text editor. This is the
+ *      most reliable notification channel in the Fusion post engine.
+ *
+ *   2. warning() calls - appear in the Warnings tab of the Post Process dialog.
+ *      Useful as a secondary channel but can be missed if the tab is not opened.
+ *
+ * Setup naming convention:  <setup-naam>_<graden>deg
+ * Examples: OP1_0deg   OP2_90deg   Opstelling3_-45deg   Vlak_22.5deg
+ */
+function reportAAxisIndexingSummary() {
+  var CONVENTION = "<setup-naam>_<graden>deg";
+  var EXAMPLES   = "bijv. OP1_0deg  /  Opstelling2_90deg  /  Vlak3_-45deg";
+
+  // ---- Collect unique setups in program order ----
+  var setups    = [];   // [{name, angle, bad}]
+  var seenJobs  = {};
+  for (var i = 0; i < getNumberOfSections(); i++) {
+    var jobDesc = getSection(i).getParameter("job-description", "");
+    if (jobDesc == "" || seenJobs[jobDesc]) { continue; }
+    seenJobs[jobDesc] = true;
+    var aDeg = getAAxisAngleFromSetupName(jobDesc);
+    setups.push({name: jobDesc, angle: aDeg, bad: (aDeg === undefined)});
+  }
+
+  // ---- 1. Write summary as NC file comments (most reliable) ----
+  writeComment("====================================");
+  writeComment("A-AS INDEXERING OVERZICHT");
+  writeComment("Naamconventie setup: " + CONVENTION);
+  writeComment(EXAMPLES);
+  writeComment("------------------------------------");
+  for (var i = 0; i < setups.length; i++) {
+    var s = setups[i];
+    if (!s.bad) {
+      writeComment("SETUP " + (i + 1) + ": " + s.name + "  =>  A = " + s.angle + " deg  [OK]");
+    } else {
+      writeComment("SETUP " + (i + 1) + ": " + s.name + "  =>  GEEN A-AS HOEK GEVONDEN  [FOUT]");
+    }
+  }
+  writeComment("====================================");
+
+  // ---- 2. warning() for setups with an invalid name (secondary channel) ----
+  for (var j = 0; j < setups.length; j++) {
+    var s = setups[j];
+    if (!s.bad) { continue; }
+    warning(
+      "SETUP \"" + s.name + "\" - naam volgt NIET de vereiste naamconventie." +
+      "\nVerwacht: " + CONVENTION + "  (" + EXAMPLES + ")" +
+      "\nRegels:" +
+      "\n  - Naam eindigt op underscore + getal + 'deg'  (hoofdletterongevoelig)" +
+      "\n  - Negatieve hoeken toegestaan:  _-90deg" +
+      "\n  - Decimale hoeken toegestaan:   _22.5deg" +
+      "\nGEVOLG: A-as wordt NIET automatisch gepositioneerd voor deze setup." +
+      "\nACTIE:  Pas de setup-naam aan in Fusion 360 en genereer opnieuw."
+    );
+  }
+}
+
+/**
+ * Parses the A-axis index angle (in degrees) from a Fusion 360 SETUP name
+ * that follows the convention:
+ *
+ *   <setup-naam>_<graden>deg
+ *
+ * Examples: "OP1_0deg"  "Opstelling2_90deg"  "Vlak_-45deg"  "Fase4_22.5deg"
+ *
+ * Returns the angle as a Number, or undefined when the pattern is absent.
+ * Matching is case-insensitive; negative and decimal values are supported.
+ */
+function getAAxisAngleFromSetupName(setupName) {
+  var s = setupName.toLowerCase();
+  // must end in "deg"
+  if (s.length < 5 ||
+      s.charAt(s.length - 3) != "d" ||
+      s.charAt(s.length - 2) != "e" ||
+      s.charAt(s.length - 1) != "g") {
+    return undefined;
+  }
+  // find the last underscore before "deg"
+  var underIdx = s.lastIndexOf("_", s.length - 4);
+  if (underIdx < 0) { return undefined; }
+  var numStr = setupName.substring(underIdx + 1, setupName.length - 3);
+  var angle = parseFloat(numStr);
+  return isNaN(angle) ? undefined : angle;
 }
 
 function onSection() {
@@ -343,7 +434,58 @@ function onSection() {
     }
   }
 
-  writeComment(getParameter("operation-comment", ""));
+  // ---- Setup-based A-axis indexing: "<setup-naam>_<graden>deg" ----
+  // The A-axis angle lives in the SETUP name (job-description), not in the
+  // individual tool-operation name.  Fusion groups multiple tool operations under
+  // one setup; a new A-axis position therefore only needs to be indexed when the
+  // active setup changes.
+  //
+  // Notifications use two channels:
+  //   • NC file comments  – written into the G-code file; always visible in the
+  //                         Fusion 360 NC-preview and in any text editor.
+  //   • warning()         – appears in the Post Process dialog Warnings tab
+  //                         (secondary; can be missed if the tab is not opened).
+  var _jobDesc  = getParameter("job-description", "");
+  var _opComment = getParameter("operation-comment", "");
+  var _setupChanged = (_jobDesc != currentJobDescription);
+
+  if (_setupChanged) {
+    currentJobDescription = _jobDesc;
+    var _newADeg = getAAxisAngleFromSetupName(_jobDesc);
+
+    if (_newADeg !== undefined) {
+      if (currentNamedAAxisAngleDeg === undefined ||
+          Math.abs(_newADeg - currentNamedAAxisAngleDeg) > 1e-3) {
+        // NC comment: traceability + visible in Fusion preview
+        writeComment("--- SETUP: " + _jobDesc + " ---");
+        writeComment("A-AS INDEXERING: " + _newADeg + " deg");
+        writeRetract(Z);                              // Z safe before A move
+        onCommand(COMMAND_UNLOCK_MULTI_AXIS);         // M45  brake RELEASE
+        forceABC();                                   // force A output even if modal thinks it's current
+        gMotionModal.reset();                         // force G0 output
+        writeBlock(gMotionModal.format(0), aOutput.format(toRad(_newADeg)));  // G0 A<degrees>
+        onCommand(COMMAND_LOCK_MULTI_AXIS);           // M46  brake CLAMP
+        setCurrentABC(new Vector(toRad(_newADeg), 0, 0)); // update simulation/modal state
+        currentWorkPlaneABC = new Vector(toRad(_newADeg), 0, 0); // suppress duplicate in setWorkPlane
+        currentNamedAAxisAngleDeg = _newADeg;
+      } else {
+        // Same angle as before: no move, but still mark the setup transition
+        writeComment("--- SETUP: " + _jobDesc + " ---");
+        writeComment("A-AS: " + _newADeg + " deg (geen beweging nodig, al in positie)");
+      }
+    } else {
+      // Setup name does not match the convention - write into NC file AND warning()
+      var _badMsg =
+        "OPGELET: setup-naam \"" + _jobDesc + "\" volgt niet de naamconventie " +
+        "(<naam>_<graden>deg). A-as NIET gepositioneerd.";
+      writeComment("--- SETUP: " + _jobDesc + " ---");
+      writeComment(_badMsg);
+      warning(_badMsg);
+    }
+  }
+  // ---- End setup-based A-axis indexing ----
+
+  writeComment(_opComment);
   // tool change
   writeToolCall(tool, insertToolCall);
   if (!isTappingCycle() || (isTappingCycle() && !(getProperty("useRigidTapping") == "without"))) {
@@ -752,6 +894,8 @@ var optionalSection = false;
 var currentWorkOffset;
 var forceSpindleSpeed = false;
 var operationNeedsSafeStart = false; // used to convert blocks to optional for safeStartAllOperations
+var currentNamedAAxisAngleDeg = undefined; // tracks A-axis position (deg) set via setup-name convention
+var currentJobDescription    = undefined; // tracks active setup name (job-description)
 
 function activateMachine() {
   // disable unsupported rotary axes output
@@ -2012,7 +2156,16 @@ var gRotationModal = createOutputVariable({current : 69,
 
 var currentWorkPlaneABC = undefined;
 function forceWorkPlane() {
-  currentWorkPlaneABC = undefined;
+  // When a named A-axis position is active (set via setup-name convention),
+  // preserve it so that setWorkPlane() does NOT re-output M45/G0 A/M46 for
+  // every tool change within the same setup.  Without this, writeToolCall()
+  // would call forceWorkPlane(), clear currentWorkPlaneABC, and cause
+  // setWorkPlane() to think the workplane needs re-establishing.
+  if (currentNamedAAxisAngleDeg !== undefined) {
+    currentWorkPlaneABC = new Vector(toRad(currentNamedAAxisAngleDeg), 0, 0);
+  } else {
+    currentWorkPlaneABC = undefined;
+  }
 }
 
 function cancelWCSRotation() {
@@ -2035,6 +2188,15 @@ function cancelWorkPlane(force) {
 }
 
 function setWorkPlane(abc) {
+  // When the A-axis is managed by the setup-name convention (onSection block),
+  // replace abc.x with the named angle before the comparison.  Fusion computes
+  // abc in the LOCAL frame of the tilted setup (so abc.x == 0 even when the
+  // machine must sit at 90°), which would otherwise cause setWorkPlane to emit
+  // an unwanted M45/G0 A0./M46 that undoes our positioning.
+  if (currentNamedAAxisAngleDeg !== undefined) {
+    abc = new Vector(toRad(currentNamedAAxisAngleDeg), abc.y, abc.z);
+  }
+
   if (!settings.workPlaneMethod.forceMultiAxisIndexing && is3D() && !machineConfiguration.isMultiAxisConfiguration()) {
     return; // ignore
   }
@@ -2349,5 +2511,5 @@ function getProgramNumber() {
 // <<<<< INCLUDED FROM include_files/getProgramNumber_fanuc.cpi
 // <<<<< INCLUDED FROM ../common/mitsubishi mill.cps
 
-properties.preloadTool.value = true; // preloads next tool on tool change if any
+properties.preloadTool.value = false; // Huaya: geen tool preloading
 properties.toolChangeOrder.value = "TxxM06"; // output order of tool change block "TxxM06" or "M06Txx"
